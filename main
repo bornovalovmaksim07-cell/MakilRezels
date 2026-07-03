@@ -1,0 +1,421 @@
+import logging
+import sqlite3
+import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
+from telegram.request import HTTPXRequest
+
+# ==================== КОНФИГУРАЦИЯ БОТА ====================
+TOKEN = "8679711038:AAHVohQbXIbArSmIQKGBJ-bER5w4Jz-aAsE" 
+ADMIN_IDS = [7929388828]  # Твой Telegram ID (числом)
+
+# НАСТРОЙКА КАНАЛА ДЛЯ ОБЯЗАТЕЛЬНОЙ ПОДПИСКИ
+CHANNEL_ID = -100123456789  # ID твоего канала (ОБЯЗАТЕЛЬНО должен начинаться с -100)
+CHANNEL_LINK = "https://t.me/MagicCheatRessel"  # Ссылка на твой Telegram-канал
+
+# НАСТРОЙКИ ТОВАРА И ОПЛАТЫ
+PRODUCT_NAME = "Magic VIP 1d"
+PRODUCT_PRICE = "270р"
+BANK_PHONE = "+79084950103"
+BANK_NAME = "Озон Банк"
+# ============================================================
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# --- Инициализация БД ---
+def init_db():
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_string TEXT UNIQUE NOT NULL,
+            product TEXT NOT NULL,
+            sold_to_user_id INTEGER,
+            sold_at TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS pending_bank_payments (
+            user_id INTEGER PRIMARY KEY,
+            product TEXT NOT NULL,
+            status TEXT NOT NULL,
+            timestamp TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# --- Вспомогательные функции для БД ---
+def add_key_to_db(key_string, product_name):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO keys (key_string, product) VALUES (?, ?)", (key_string, product_name))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+def get_available_key(product_name):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT key_string FROM keys WHERE product = ? AND sold_to_user_id IS NULL LIMIT 1", (product_name,))
+    key = cursor.fetchone()
+    conn.close()
+    return key[0] if key else None
+
+def mark_key_as_sold(key_string, user_id):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    cursor.execute("UPDATE keys SET sold_to_user_id = ?, sold_at = ? WHERE key_string = ?", (user_id, now, key_string))
+    conn.commit()
+    conn.close()
+
+def get_all_keys(product_name):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT key_string, sold_to_user_id FROM keys WHERE product = ?", (product_name,))
+    keys_data = cursor.fetchall()
+    conn.close()
+    return keys_data
+
+def add_pending_bank_payment(user_id, product):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    cursor.execute("INSERT OR REPLACE INTO pending_bank_payments (user_id, product, status, timestamp) VALUES (?, ?, ?, ?)",
+                   (user_id, product, 'pending_screenshot', now))
+    conn.commit()
+    conn.close()
+
+def get_pending_bank_payment(user_id):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT product, status FROM pending_bank_payments WHERE user_id = ?", (user_id,))
+    payment = cursor.fetchone()
+    conn.close()
+    return {'product': payment[0], 'status': payment[1]} if payment else None
+
+def update_pending_bank_payment_status(user_id, status):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE pending_bank_payments SET status = ? WHERE user_id = ?", (status, user_id))
+    conn.commit()
+    conn.close()
+
+def remove_pending_bank_payment(user_id):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM pending_bank_payments WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+# --- Проверка обязательной подписки на канал ---
+async def is_subscribed(bot, user_id) -> bool:
+    if CHANNEL_ID == -100123456789 or CHANNEL_ID == 0:
+        return True # Если канал еще не настроен, пропускаем проверку
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        if member.status in ['member', 'creator', 'administrator']:
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Ошибка проверки подписки: {e}")
+        # Если бота еще не добавили в админы канала, временно разрешаем доступ
+        return True 
+
+async def check_and_prompt_subscription(update: Update, context) -> bool:
+    user_id = update.effective_user.id
+    if is_admin(user_id):
+        return True
+        
+    subscribed = await is_subscribed(context.bot, user_id)
+    if not subscribed:
+        text = (
+            "⚠️ **ДОСТУП ОГРАНИЧЕН!**\n\n"
+            "Для использования бота и покупки приватных ключей необходимо быть подписанным на наш официальный Telegram-канал! 👇"
+        )
+        keyboard = [
+            [InlineKeyboardButton("📢 Перейти в канал", url=CHANNEL_LINK)],
+            [InlineKeyboardButton("✅ Проверить подписку", callback_data="check_subscription")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if update.callback_query:
+            await update.callback_query.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        return False
+    return True
+
+# --- Реализация главного меню ---
+async def send_main_menu(message, user):
+    keyboard = [[InlineKeyboardButton(f"💎 Купить {PRODUCT_NAME} | {PRODUCT_PRICE}", callback_data='buy_magic_vip_1d')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await message.reply_text(
+        f"👋 **Приветствуем, {user.first_name}!**\n\n"
+        f"Ты попал в магазин приватного софта **Magic Cheat** для игры *Oxide: Survival Island*! 🛡️\n\n"
+        f"🔥 **Доступные товары:**\n"
+        f"└  `{PRODUCT_NAME}` — мощный функционал на 24 часа за **{PRODUCT_PRICE}**.\n\n"
+        f"Нажми на кнопку ниже для моментального оформления заказа! 👇",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+# --- Обработчики команд ---
+async def start_command(update: Update, context):
+    if not await check_and_prompt_subscription(update, context):
+        return
+    await send_main_menu(update.message, update.effective_user)
+
+async def check_subscription_callback(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    if await is_subscribed(context.bot, user_id):
+        await query.message.reply_text("🎉 **Спасибо за подписку! Доступ открыт.**")
+        await send_main_menu(query.message, query.from_user)
+    else:
+        await query.message.reply_text("❌ **Вы всё еще не подписались на канал!** Пожалуйста, сделайте это.")
+
+async def buy_callback(update: Update, context):
+    if not await check_and_prompt_subscription(update, context):
+        return
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("🌐 Оплатить через платежную систему", callback_data='pay_gateway_magic_vip_1d')],
+        [InlineKeyboardButton("💳 Перевод СБП (на карту/номер)", callback_data='pay_bank_magic_vip_1d')],
+        [InlineKeyboardButton("⬅️ В меню", callback_data='back_to_menu')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(
+        f"🛒 **Оформление заказа:**\n\n"
+        f"📦 Товар: `{PRODUCT_NAME}`\n"
+        f"💰 К оплате: **{PRODUCT_PRICE}**\n\n"
+        f"Пожалуйста, выбери удобный способ оплаты ниже 👇:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+async def payment_method_callback(update: Update, context):
+    if not await check_and_prompt_subscription(update, context):
+        return
+    query = update.callback_query
+    await query.answer()
+    method = query.data.split('_')[1]
+
+    if method == 'gateway':
+        # Отключение платежной системы согласно ТЗ
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data='buy_magic_vip_1d')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "⚠️ **Внимание!**\n\n"
+            "Эта функция в данный момент недоступна.\n"
+            "Пожалуйста, используйте перевод СБП на карту/номер телефона.",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    elif method == 'bank':
+        user_id = query.from_user.id
+        add_pending_bank_payment(user_id, PRODUCT_NAME)
+        
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data='buy_magic_vip_1d')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"💳 **Оплата переводом (СБП):**\n\n"
+            f"Для покупки `{PRODUCT_NAME}` переведите **{PRODUCT_PRICE}** по реквизитам:\n\n"
+            f"📱 Номер телефона: `{BANK_PHONE}`\n"
+            f"🏦 Банк получателя: **{BANK_NAME}**\n\n"
+            f"🛑 **ОБЯЗАТЕЛЬНОЕ ТРЕБОВАНИЕ:**\n"
+            f"После оплаты обязательно скиньте в этот чат чек (скриншот/документ), на котором четко видно:\n"
+            f"1️⃣ **Время оплаты**\n"
+            f"2️⃣ **Получателя платежа**\n"
+            f"3️⃣ **Сумму перевода ({PRODUCT_PRICE})**\n\n"
+            f"Как только вы пришлете скриншот, администратор проверит транзакцию и бот выдаст вам ключ автоматически! 🔑",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        # Уведомляем первого админа в списке о том, что юзер зашел на экран реквизитов
+        username_str = f"@{query.from_user.username}" if query.from_user.username else query.from_user.first_name
+        await context.bot.send_message(
+            chat_id=ADMIN_IDS[0],
+            text=f"📊 Пользователь `{user_id}` ({username_str}) открыл реквизиты для оплаты **{PRODUCT_NAME}**."
+        )
+
+async def back_to_menu_callback(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    await send_main_menu(query.message, query.from_user)
+
+# --- Прием чеков от пользователей ---
+async def handle_message(update: Update, context):
+    user_id = update.message.from_user.id
+    if not await check_and_prompt_subscription(update, context):
+        return
+        
+    pending_payment = get_pending_bank_payment(user_id)
+
+    # Проверяем, ожидает ли бот подтверждения оплаты от этого пользователя
+    if pending_payment and pending_payment['status'] in ['pending_screenshot', 'waiting_admin']:
+        await update.message.reply_text(
+            "✅ **Чек принят на проверку!**\n\n"
+            "Ваш платеж отправлен администратору. Ожидайте подтверждения, проверка занимает не более 5-15 минут. "
+            "При успешной верификации бот пришлет вам ключ прямо сюда! 🔑",
+            parse_mode='Markdown'
+        )
+        update_pending_bank_payment_status(user_id, 'waiting_admin')
+        
+        # Пересылаем сообщение с чеком администратору
+        await context.bot.forward_message(
+            chat_id=ADMIN_IDS[0],
+            from_chat_id=user_id,
+            message_id=update.message.message_id
+        )
+        
+        username_str = f"@{update.message.from_user.username}" if update.message.from_user.username else update.message.from_user.first_name
+        # Отправляем админу структурированное оповещение
+        await context.bot.send_message(
+            chat_id=ADMIN_IDS[0],
+            text=f"📥 **ПОЛУЧЕН НОВЫЙ ЧЕК ОБ ОПЛАТЕ!**\n\n"
+                 f"👤 **Пользователь:** `{user_id}` ({username_str})\n"
+                 f"📦 **Товар:** `{pending_payment['product']}`\n"
+                 f"💳 **Реквизиты:** {BANK_NAME} ({BANK_PHONE})\n\n"
+                 f"🔍 **ВНИМАТЕЛЬНО проверьте на чеке:**\n"
+                 f"└ Время, получателя и сумму (**{PRODUCT_PRICE}**).\n\n"
+                 f"🔑 **Для подтверждения платежа и выдачи ключа введите:**\n"
+                 f"`/confirm {user_id}`",
+            parse_mode='Markdown'
+        )
+    elif update.message.text and update.message.text.startswith('/'):
+         pass
+    else:
+        await update.message.reply_text(
+            "❌ **Неизвестный запрос.**\n\n"
+            "Используйте кнопки меню для взаимодействия с ботом или команду /start.",
+            parse_mode='Markdown'
+        )
+
+# --- АДМИН-КОМАНДЫ ---
+async def addkey_command(update: Update, context):
+    if not is_admin(update.message.from_user.id):
+        await update.message.reply_text("У вас нет прав администратора.")
+        return
+
+    try:
+        key_string = context.args[0]
+        product_name_arg = context.args[1] if len(context.args) > 1 else PRODUCT_NAME
+        
+        if add_key_to_db(key_string, product_name_arg):
+            await update.message.reply_text(f"✅ Ключ `{key_string}` для **{product_name_arg}** добавлен в базу данных.", parse_mode='Markdown')
+        else:
+            await update.message.reply_text(f"❌ Ошибка: Ключ `{key_string}` уже существует.", parse_mode='Markdown')
+    except IndexError:
+        await update.message.reply_text("⚠️ Использование: `/addkey <ключ> [название_продукта]`")
+
+async def listkeys_command(update: Update, context):
+    if not is_admin(update.message.from_user.id):
+        await update.message.reply_text("У вас нет прав администратора.")
+        return
+    
+    product_name_filter = context.args[0] if context.args else PRODUCT_NAME
+    keys_data = get_all_keys(product_name_filter)
+    
+    if not keys_data:
+        await update.message.reply_text(f"Нет ключей для продукта **'{product_name_filter}'**.", parse_mode='Markdown')
+        return
+    
+    response = f"📋 **Список ключей для {product_name_filter}:**\n"
+    available_count = 0
+    sold_count = 0
+    
+    for key, sold_to in keys_data:
+        status = f" (Продан: `{sold_to}`)" if sold_to else " (Доступен)"
+        response += f"- `{key}`{status}\n"
+        if sold_to:
+            sold_count += 1
+        else:
+            available_count += 1
+    
+    response += f"\n📊 **Статистика:**\n└ Доступно: {available_count} шт.\n└ Продано: {sold_count} шт."
+    await update.message.reply_text(response, parse_mode='Markdown')
+
+async def confirm_bank_payment_command(update: Update, context):
+    if not is_admin(update.message.from_user.id):
+        await update.message.reply_text("У вас нет прав администратора.")
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+        pending_payment = get_pending_bank_payment(target_user_id)
+
+        if not pending_payment:
+            await update.message.reply_text(f"❌ Нет активных платежей от пользователя `{target_user_id}`.", parse_mode='Markdown')
+            return
+        
+        product_to_issue = pending_payment['product']
+        key = get_available_key(product_to_issue)
+
+        if key:
+            mark_key_as_sold(key, target_user_id)
+            remove_pending_bank_payment(target_user_id)
+            
+            # Отправка товара покупателю
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=f"🎉 **Ваш платеж успешно подтвержден!**\n\n"
+                     f"📦 Купленный товар: `{product_to_issue}`\n"
+                     f"🔑 Ваш лицензионный ключ:\n"
+                     f"`{key}`\n\n"
+                     f"Спасибо за покупку, приятной игры! 🚀",
+                parse_mode='Markdown'
+            )
+            await update.message.reply_text(f"✅ Ключ `{key}` успешно выдан пользователю `{target_user_id}`.", parse_mode='Markdown')
+        else:
+            await update.message.reply_text(f"🚨 **КРИТИЧЕСКАЯ ОШИБКА:** Нет доступных ключей для **{product_to_issue}**! "
+                                             f"Добавьте ключи в базу данных и подтвердите платеж заново.", parse_mode='Markdown')
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ Использование: `/confirm <user_id>`")
+
+# --- Запуск ---
+def main():
+    init_db()
+
+    # Оптимальные таймауты подключения для Pydroid 3 и VPN
+    custom_request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
+
+    application = Application.builder().token(TOKEN).request(custom_request).build()
+
+    # Коллбэки и текстовые сообщения
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CallbackQueryHandler(check_subscription_callback, pattern='^check_subscription$'))
+    application.add_handler(CallbackQueryHandler(buy_callback, pattern='^buy_magic_vip_1d$'))
+    application.add_handler(CallbackQueryHandler(payment_method_callback, pattern='^pay_(gateway|bank)_magic_vip_1d$'))
+    application.add_handler(CallbackQueryHandler(back_to_menu_callback, pattern='^back_to_menu$'))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+
+    # Админские команды
+    application.add_handler(CommandHandler("addkey", addkey_command))
+    application.add_handler(CommandHandler("keys", listkeys_command))
+    application.add_handler(CommandHandler("confirm", confirm_bank_payment_command))
+
+    logger.info("Бот запущен и ожидает обновлений...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
